@@ -62,7 +62,7 @@ def get_peer_by_id(peers, peer_id):
             return peer
     return None
 
-# Parses the common config, storing the settings in a dictionary
+# Returns the prior peers
 def get_previous_peers(peers, peer_id):
     previous = []
     for peer in peers:
