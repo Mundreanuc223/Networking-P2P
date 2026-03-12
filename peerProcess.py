@@ -47,6 +47,8 @@ def main():
 
     this_peer = Peer(peer_id, common_config, peer_info)
 
+
+
     print("\nPeer object created successfully.")
     print(f"Peer ID: {this_peer.peer_id}")
     print("\nPeer object created successfully.")
@@ -54,7 +56,25 @@ def main():
     print("Bitfield length:", len(this_peer.bitfield))
     print("First 10 bitfield entries:", this_peer.bitfield[:10])
     this_peer.start_server()
+
+    full_bitfield = [1] * this_peer.num_pieces
+    empty_bitfield = [0] * this_peer.num_pieces
+
+    print("Interested in full bitfield:", this_peer.is_interested_in(full_bitfield))
+    print("Interested in empty bitfield:", this_peer.is_interested_in(empty_bitfield))
+    print("First piece to request from full bitfield:", this_peer.choose_piece_to_request(full_bitfield))
     input("Press Enter to exit...\n")
+
+    print("Is complete:", this_peer.is_complete())
+    print("Needs from full bitfield:", this_peer.needed_pieces_from([1] * this_peer.num_pieces)[:10])
+
+
+
+    print("Loaded piece count:", this_peer.piece_count_loaded())
+    print("Piece 0 exists:", this_peer.get_piece(0) is not None)
+    print("Piece 0 size:", len(this_peer.get_piece(0)) if this_peer.get_piece(0) else 0)
+
+
 
 
 if __name__ == "__main__":
