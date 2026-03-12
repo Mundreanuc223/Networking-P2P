@@ -51,9 +51,23 @@ def make_piece(piece_index, data):
 
 # TODO: make_bitfield function
 
+def make_bitfield(bitfield):
+    payload = bytes(bitfield)
+    return make_message(MSG_BITFIELD, payload)
+
+
+def parse_bitfield(payload):
+    return list(payload)
+
+
 # Interprets the received message, returns the message type and payload
 def parse_message_body(data):
     msg_type = data[0]
     payload = data[1:]
     return msg_type, payload
 
+def parse_full_message(data):
+    length = bytes_to_int(data[:4])
+    body = data[4:4 + length]
+    msg_type, payload = parse_message_body(body)
+    return length, msg_type, payload
