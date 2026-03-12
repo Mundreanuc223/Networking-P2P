@@ -1,4 +1,4 @@
-# This file defines the actual messages a peer can send
+# This file defines the actual messages a peer can send (helper functions)
 # Excluding handshakes - see handshake.py
 
 # Constant bit values for different message types (specified in doc)
@@ -49,15 +49,26 @@ def make_request(piece_index):
 def make_piece(piece_index, data):
     return make_message(MSG_PIECE, int_to_4_bytes(piece_index) + data)
 
-# TODO: make_bitfield function
-
 def make_bitfield(bitfield):
-    payload = bytes(bitfield)
-    return make_message(MSG_BITFIELD, payload)
+    num_bytes = (len(bitfield) + 7) // 8
+    result = bytearray(num_bytes) # empty array of bytes
+    for i in range(len(bitfield)):
+        if bitfield[i] == 1:
+            byte_index = i // 8 # Byte it belongs to
+            bit_position = 7 - (i % 8) # Outer left bit
+            result[byte_index] |= (1 << bit_position) # sets that specific bit to 1
+    return make_message(MSG_BITFIELD, bytes(result))
 
 
-def parse_bitfield(payload):
-    return list(payload)
+# Reverse of make bitfield above, converts the bytes back to list of bits
+def parse_bitfield(payload, num_pieces):
+    bitfield = []
+    for i in range(num_pieces):
+        byte_index = i // 8
+        bit_position = 7 - (i % 8)
+        bit = (payload[byte_index] >> bit_position) & 1
+        bitfield.append(bit)
+    return bitfield
 
 
 # Interprets the received message, returns the message type and payload

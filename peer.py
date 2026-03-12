@@ -1,7 +1,11 @@
 import os
 import math
+import random
 import socket
+import threading
 from handshake import make_handshake, parse_handshake
+from peer_message import *
+import time
 
 HANDSHAKE_LENGTH = 32
 SERVER_TIMEOUT = 5.0
@@ -68,6 +72,14 @@ class Peer:
 
         return needed
 
+    # After downloading a piece, notify all connected neighbors
+    def broadcast_have(self, piece_index):
+        for neighbor_id, sock in self.connections.items():
+            try:
+                sock.sendall(make_have(piece_index))
+            except Exception as e:
+                print(f"Failed to send have to peer {neighbor_id}: {e}")
+
     def is_complete(self):
         return all(bit == 1 for bit in self.bitfield)
 
@@ -82,11 +94,9 @@ class Peer:
         print(f"Peer {self.peer_id} listening on {self.host}:{self.port}")
 
     def send_bitfield(self, sock):
-        from peer_message import make_bitfield
         sock.sendall(make_bitfield(self.bitfield))
 
     def receive_message(self, sock):
-        from peer_message import bytes_to_int, parse_message_body
 
         length_bytes = self.receive_bytes(sock, 4)
         length = bytes_to_int(length_bytes)
@@ -95,13 +105,12 @@ class Peer:
         return msg_type, payload
 
     def receive_bitfield(self, sock):
-        from peer_message import MSG_BITFIELD, parse_bitfield
 
         msg_type, payload = self.receive_message(sock)
         if msg_type != MSG_BITFIELD:
             raise ValueError(f"Expected bitfield message, got type {msg_type}")
 
-        return parse_bitfield(payload)
+        return parse_bitfield(payload, self.num_pieces)
 
     def connect_to_previous_peers(self):
         for peer in self.peer_info:
@@ -156,18 +165,17 @@ class Peer:
     def is_interested_in(self, remote_bitfield):
         return len(self.needed_pieces_from(remote_bitfield)) > 0
 
+    # Selects a random piece it does not have
     def choose_piece_to_request(self, remote_bitfield):
         needed = self.needed_pieces_from(remote_bitfield)
         if not needed:
             return None
-        return needed[0]
+        return random.choice(needed)
 
     def send_interested(self, sock):
-        from peer_message import make_interested
         sock.sendall(make_interested())
 
     def send_not_interested(self, sock):
-        from peer_message import make_not_interested
         sock.sendall(make_not_interested())
 
     def send_interest_decision(self, sock, remote_bitfield):
@@ -179,17 +187,14 @@ class Peer:
             print(f"Peer {self.peer_id} sent NOT_INTERESTED")
 
     def send_request(self, sock, piece_index):
-        from peer_message import make_request
         sock.sendall(make_request(piece_index))
 
     def parse_request_payload(self, payload):
-        from peer_message import bytes_to_int
         if len(payload) != 4:
             raise ValueError("Request payload must be 4 bytes")
         return bytes_to_int(payload)
 
     def send_piece_message(self, sock, piece_index):
-        from peer_message import make_piece
 
         piece_data = self.get_piece(piece_index)
         if piece_data is None:
@@ -198,7 +203,6 @@ class Peer:
         sock.sendall(make_piece(piece_index, piece_data))
 
     def parse_piece_payload(self, payload):
-        from peer_message import bytes_to_int
 
         if len(payload) < 4:
             raise ValueError("Piece payload must include piece index and data")
@@ -206,8 +210,6 @@ class Peer:
         piece_index = bytes_to_int(payload[:4])
         piece_data = payload[4:]
         return piece_index, piece_data
-
-
 
     def perform_outgoing_handshake(self, sock, expected_peer_id):
         sock.sendall(make_handshake(self.peer_id))
@@ -230,3 +232,41 @@ class Peer:
             f"Peer(peer_id={self.peer_id}, host={self.host}, port={self.port}, "
             f"has_file={self.has_file}, num_pieces={self.num_pieces})"
         )
+
+    # Waits for peers to connect to it
+    def accept_connections(self):
+        while True:
+            try:
+                sock, address = self.server_socket.accept()
+
+                # read the peers handshake and send one back
+                data = self.receive_bytes(sock, HANDSHAKE_LENGTH)
+                remote_peer_id = parse_handshake(data)
+                sock.sendall(make_handshake(self.peer_id))
+
+                # Store the socket for later
+                self.connections[remote_peer_id] = sock
+                print(f"Peer {self.peer_id} accepted connection from peer {remote_peer_id}")
+
+                # TODO: startanother thread here that actually listens dor messages
+                # each peer connection has a thread
+
+            except Exception as e:
+                print(f"Accept error: {e}")
+
+    # Starts the given peer and allows it to accept connections
+    def start(self):
+        self.start_server() # Starts the server
+
+        # Accept incoming connections and connect to prior peers
+        accept_thread = threading.Thread(target=self.accept_connections)
+        accept_thread.daemon = True
+        accept_thread.start()
+
+        # Connect to all the peers that have already been started
+        self.connect_to_previous_peers()
+
+        # TODO: start choke/unchoke timers here
+
+        while True:
+            time.sleep(1)
