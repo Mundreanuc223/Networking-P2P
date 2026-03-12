@@ -1,6 +1,10 @@
 import os
 import math
 import socket
+from handshake import make_handshake, parse_handshake
+
+HANDSHAKE_LENGTH = 32
+SERVER_TIMEOUT = 5.0
 
 
 class Peer:
@@ -50,13 +54,42 @@ class Peer:
     def connect_to_previous_peers(self):
         for peer in self.peer_info:
             if peer["peer_id"] < self.peer_id:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect((peer["host"], peer["port"]))
-                    self.connections[peer["peer_id"]] = sock
-                    print(f"Peer {self.peer_id} connected to peer {peer['peer_id']}")
-                except Exception as e:
-                    print(f"Peer {self.peer_id} failed to connect to peer {peer['peer_id']}: {e}")
+                sock = None
+            try:  
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(SERVER_TIMEOUT)
+                sock.connect((peer["host"], peer["port"]))
+                remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
+                self.connections[remote_peer_id] = sock
+                print(f"Peer {self.peer_id} connected to peer {peer['peer_id']}")
+            except Exception as e:
+                self.close_socket(sock)
+                print(f"Peer {self.peer_id} failed to connect to peer {peer['peer_id']}: {e}")
+
+    def receive_bytes(self, sock, size):
+        buffer = bytearray()
+        while len(buffer) < size:
+            chunk = sock.recv(size - len(buffer))
+            if not chunk:
+                raise ConnectionError("Socket closed before enough bytes were received")
+            buffer.extend(chunk)
+        return bytes(buffer)
+    
+    def perform_outgoing_handshake(self, sock, expected_peer_id):
+        sock.sendall(make_handshake(self.peer_id))
+        response = self.receive_bytes(sock, HANDSHAKE_LENGTH)
+        remote_peer_id = parse_handshake(response)
+        if remote_peer_id != expected_peer_id:
+            raise ValueError(f"Expected peer {expected_peer_id}, but received handshake from {remote_peer_id}")
+        return remote_peer_id
+
+    def close_socket(self, sock):
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except OSError:
+            pass
 
     def __repr__(self):
         return (
