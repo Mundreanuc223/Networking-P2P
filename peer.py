@@ -3,9 +3,11 @@ import math
 import random
 import socket
 import threading
+import time
+
 from handshake import make_handshake, parse_handshake
 from peer_message import *
-import time
+
 
 HANDSHAKE_LENGTH = 32
 SERVER_TIMEOUT = 5.0
@@ -31,6 +33,8 @@ class Peer:
 
         self.server_socket = None
         self.connections = {}
+        self.remote_bitfields = {}
+        self.peer_choking_us = {}
         self.pieces = {}
         if self.has_file:
             self.load_file_into_pieces()
@@ -123,6 +127,9 @@ class Peer:
                     sock.connect((peer["host"], peer["port"]))
                     remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
                     self.connections[remote_peer_id] = sock
+                    self.peer_choking_us[remote_peer_id] = True
+                    self.send_bitfield(sock)
+                    self.start_peer_listener(remote_peer_id, sock)
                     print(f"Peer {self.peer_id} connected to peer {peer['peer_id']}")
                 except Exception as e:
                     self.close_socket(sock)
@@ -211,6 +218,64 @@ class Peer:
         piece_data = payload[4:]
         return piece_index, piece_data
 
+    def handle_message(self, remote_peer_id, sock, msg_type, payload):
+        if msg_type == MSG_BITFIELD:
+            remote_bitfield = parse_bitfield(payload, self.num_pieces)
+            self.remote_bitfields[remote_peer_id] = remote_bitfield
+            self.send_interest_decision(sock, remote_bitfield)
+            return
+
+        if msg_type == MSG_INTERESTED:
+            print(f"Peer {self.peer_id} received INTERESTED from {remote_peer_id}")
+            sock.sendall(make_unchoke())
+            return
+
+        if msg_type == MSG_NOT_INTERESTED:
+            print(f"Peer {self.peer_id} received NOT_INTERESTED from {remote_peer_id}")
+            return
+
+        if msg_type == MSG_CHOKE:
+            self.peer_choking_us[remote_peer_id] = True
+            print(f"Peer {self.peer_id} was CHOKED by {remote_peer_id}")
+            return
+
+        if msg_type == MSG_UNCHOKE:
+            self.peer_choking_us[remote_peer_id] = False
+            print(f"Peer {self.peer_id} was UNCHOKED by {remote_peer_id}")
+
+            remote_bitfield = self.remote_bitfields.get(remote_peer_id)
+            if remote_bitfield is None:
+                return
+
+            piece_index = self.choose_piece_to_request(remote_bitfield)
+            if piece_index is not None:
+                self.send_request(sock, piece_index)
+                print(f"Peer {self.peer_id} requested piece {piece_index} from {remote_peer_id}")
+            return
+
+        if msg_type == MSG_REQUEST:
+            piece_index = self.parse_request_payload(payload)
+            if self.has_piece(piece_index):
+                self.send_piece_message(sock, piece_index)
+            return
+
+        if msg_type == MSG_PIECE:
+            piece_index, piece_data = self.parse_piece_payload(payload)
+            self.set_piece(piece_index, piece_data)
+            print(f"Peer {self.peer_id} received piece {piece_index} from {remote_peer_id}")
+            self.broadcast_have(piece_index)
+            return
+
+        if msg_type == MSG_HAVE:
+            piece_index = self.parse_request_payload(payload)
+            remote_bitfield = self.remote_bitfields.get(remote_peer_id, [0] * self.num_pieces)
+            if piece_index < 0 or piece_index >= self.num_pieces:
+                raise ValueError(f"Invalid HAVE piece index: {piece_index}")
+
+            remote_bitfield[piece_index] = 1
+            self.remote_bitfields[remote_peer_id] = remote_bitfield
+            self.send_interest_decision(sock, remote_bitfield)
+
     def perform_outgoing_handshake(self, sock, expected_peer_id):
         sock.sendall(make_handshake(self.peer_id))
         response = self.receive_bytes(sock, HANDSHAKE_LENGTH)
@@ -218,6 +283,25 @@ class Peer:
         if remote_peer_id != expected_peer_id:
             raise ValueError(f"Expected peer {expected_peer_id}, but received handshake from {remote_peer_id}")
         return remote_peer_id
+
+    def start_peer_listener(self, remote_peer_id, sock):
+        listener = threading.Thread(
+            target=self.peer_message_loop,
+            args=(remote_peer_id, sock),
+            daemon=True,
+        )
+        listener.start()
+
+    def peer_message_loop(self, remote_peer_id, sock):
+        while True:
+            try:
+                msg_type, payload = self.receive_message(sock)
+                self.handle_message(remote_peer_id, sock, msg_type, payload)
+            except Exception as e:
+                print(f"Peer {self.peer_id} lost connection to peer {remote_peer_id}: {e}")
+                self.connections.pop(remote_peer_id, None)
+                # TODO
+                break
 
     def close_socket(self, sock):
         if sock is None:
@@ -236,8 +320,12 @@ class Peer:
     # Waits for peers to connect to it
     def accept_connections(self):
         while True:
+            server_socket = self.server_socket
+            if server_socket is None:
+                break
+
             try:
-                sock, address = self.server_socket.accept()
+                sock, address = server_socket.accept()
 
                 # read the peers handshake and send one back
                 data = self.receive_bytes(sock, HANDSHAKE_LENGTH)
@@ -246,10 +334,10 @@ class Peer:
 
                 # Store the socket for later
                 self.connections[remote_peer_id] = sock
+                self.peer_choking_us[remote_peer_id] = True
+                self.send_bitfield(sock)
+                self.start_peer_listener(remote_peer_id, sock)
                 print(f"Peer {self.peer_id} accepted connection from peer {remote_peer_id}")
-
-                # TODO: startanother thread here that actually listens dor messages
-                # each peer connection has a thread
 
             except Exception as e:
                 print(f"Accept error: {e}")
