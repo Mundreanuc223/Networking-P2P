@@ -15,45 +15,81 @@ SERVER_TIMEOUT = 5.0
 
 class Peer:
     def __init__(self, peer_id, common_config, peer_info):
+
+        # Peer ID and configs
         self.peer_id = peer_id
         self.common_config = common_config
         self.peer_info = peer_info
 
+        # Peer Info
         self.current_peer = self.find_current_peer()
         self.host = self.current_peer["host"]
         self.port = self.current_peer["port"]
         self.has_file = self.current_peer["has_file"]
 
+        # Shared peer settings
         self.file_name = self.common_config["FileName"]
         self.file_size = self.common_config["FileSize"]
         self.piece_size = self.common_config["PieceSize"]
+        self.num_preferred_neighbors = self.common_config["NumberOfPreferredNeighbors"]
+        self.unchoking_interval = self.common_config["UnchokingInterval"]
+        self.optimistic_unchoking_interval = self.common_config["OptimisticUnchokingInterval"]
 
+        # Bitfield Init
         self.num_pieces = math.ceil(self.file_size / self.piece_size)
         self.bitfield = self.initialize_bitfield()
 
+        # Connection/message states for neighbors
         self.server_socket = None
         self.connections = {}
         self.remote_bitfields = {}
         self.peer_choking_us = {}
+        self.peers_we_choking = {}
+
+        # Used for neighbor selection
+        self.interested_peers = set()
+        self.preferred_peers = set()
+        self.opt_unchoke_peer = None
+
+        # Downloading
+        self.requested_pieces = set()
+        self.download_counts = {}
+
+        # Peers we currently believe have the complete file
+        self.complete_peers = {
+            peer["peer_id"] for peer in self.peer_info if peer["has_file"]
+        }
+
+        # Path to this peer's required log file
+        self.log_path = f"log_peer_{self.peer_id}.log"
+
+        # Data peer currently has
         self.pieces = {}
+
+        self.setup_directory()
+        self.setup_log_file()
+
         if self.has_file:
             self.load_file_into_pieces()
-        self.setup_directory()
 
+    # Find this peer
     def find_current_peer(self):
         for peer in self.peer_info:
             if peer["peer_id"] == self.peer_id:
                 return peer
         raise ValueError(f"Peer ID {self.peer_id} not found in peer_info")
 
+    # Create this peer's starting bitfield (all 1 if it has the file, all 0 otherwise)
     def initialize_bitfield(self):
         if self.has_file:
             return [1] * self.num_pieces
         return [0] * self.num_pieces
 
+    # Check if this peer has a specific piece
     def has_piece(self, piece_index):
         return self.bitfield[piece_index] == 1
 
+    # Store a piece and mark the bitfield
     def set_piece(self, piece_index, data):
         if piece_index < 0 or piece_index >= self.num_pieces:
             raise ValueError(f"Invalid piece index: {piece_index}")
@@ -64,6 +100,7 @@ class Peer:
     def get_piece(self, piece_index):
         return self.pieces.get(piece_index)
 
+    # Compare this peer's bitfield to another peer's, find what this peer still needs
     def needed_pieces_from(self, remote_bitfield):
         needed = []
 
@@ -84,12 +121,14 @@ class Peer:
             except Exception as e:
                 print(f"Failed to send have to peer {neighbor_id}: {e}")
 
+    # Check if peer has every piece
     def is_complete(self):
         return all(bit == 1 for bit in self.bitfield)
 
     def setup_directory(self):
         os.makedirs(f"peer_{self.peer_id}", exist_ok=True)
 
+    # Open the TCP socket for the peer
     def start_server(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -100,8 +139,8 @@ class Peer:
     def send_bitfield(self, sock):
         sock.sendall(make_bitfield(self.bitfield))
 
+    # Reads a recieved message
     def receive_message(self, sock):
-
         length_bytes = self.receive_bytes(sock, 4)
         length = bytes_to_int(length_bytes)
         body = self.receive_bytes(sock, length)
@@ -109,13 +148,13 @@ class Peer:
         return msg_type, payload
 
     def receive_bitfield(self, sock):
-
         msg_type, payload = self.receive_message(sock)
         if msg_type != MSG_BITFIELD:
             raise ValueError(f"Expected bitfield message, got type {msg_type}")
 
         return parse_bitfield(payload, self.num_pieces)
 
+    # Connect the peer to all peers with smaller IDs
     def connect_to_previous_peers(self):
         for peer in self.peer_info:
             if peer["peer_id"] < self.peer_id:
@@ -128,9 +167,12 @@ class Peer:
                     remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
                     self.connections[remote_peer_id] = sock
                     self.peer_choking_us[remote_peer_id] = True
+                    self.peers_we_choking[remote_peer_id] = True
                     self.send_bitfield(sock)
                     self.start_peer_listener(remote_peer_id, sock)
-                    print(f"Peer {self.peer_id} connected to peer {peer['peer_id']}")
+                    self.download_counts[remote_peer_id] = 0
+                    self.log(f"Peer {self.peer_id} makes a connection to Peer {remote_peer_id}.")
+
                 except Exception as e:
                     self.close_socket(sock)
                     print(f"Peer {self.peer_id} failed to connect to peer {peer['peer_id']}: {e}")
@@ -166,17 +208,37 @@ class Peer:
                 self.bitfield[piece_index] = 1
                 piece_index += 1
 
+    # Once all pieces are acquired, update its file
+    def write_complete_file(self):
+        file_path = self.get_file_path()
+
+        with open(file_path, "wb") as f:
+            for piece_index in range(self.num_pieces):
+                piece_data = self.pieces.get(piece_index)
+                if piece_data is None:
+                    raise ValueError(f"Missing piece {piece_index}, cannot write complete file")
+
+                f.write(piece_data)
+
     def piece_count_loaded(self):
         return len(self.pieces)
 
     def is_interested_in(self, remote_bitfield):
         return len(self.needed_pieces_from(remote_bitfield)) > 0
 
-    # Selects a random piece it does not have
+    # Selects a random piece it does not have and hasn't yet requested
     def choose_piece_to_request(self, remote_bitfield):
-        needed = self.needed_pieces_from(remote_bitfield)
+        needed = []
+
+        for piece_index in self.needed_pieces_from(remote_bitfield):
+
+            # Skip pieces already in progress
+            if piece_index not in self.requested_pieces:
+                needed.append(piece_index)
+
         if not needed:
             return None
+
         return random.choice(needed)
 
     def send_interested(self, sock):
@@ -188,12 +250,11 @@ class Peer:
     def send_interest_decision(self, sock, remote_bitfield):
         if self.is_interested_in(remote_bitfield):
             self.send_interested(sock)
-            print(f"Peer {self.peer_id} sent INTERESTED")
         else:
             self.send_not_interested(sock)
-            print(f"Peer {self.peer_id} sent NOT_INTERESTED")
 
     def send_request(self, sock, piece_index):
+        self.requested_pieces.add(piece_index)
         sock.sendall(make_request(piece_index))
 
     def parse_request_payload(self, payload):
@@ -218,6 +279,7 @@ class Peer:
         piece_data = payload[4:]
         return piece_index, piece_data
 
+    # Deciphers a recieved message and acts based on what it is
     def handle_message(self, remote_peer_id, sock, msg_type, payload):
         if msg_type == MSG_BITFIELD:
             remote_bitfield = parse_bitfield(payload, self.num_pieces)
@@ -226,22 +288,25 @@ class Peer:
             return
 
         if msg_type == MSG_INTERESTED:
-            print(f"Peer {self.peer_id} received INTERESTED from {remote_peer_id}")
+            self.interested_peers.add(remote_peer_id)
+            self.log(f"Peer {self.peer_id} received the 'interested' message from {remote_peer_id}.")
             sock.sendall(make_unchoke())
+            self.peers_we_choking[remote_peer_id] = False
             return
 
         if msg_type == MSG_NOT_INTERESTED:
-            print(f"Peer {self.peer_id} received NOT_INTERESTED from {remote_peer_id}")
+            self.interested_peers.discard(remote_peer_id)
+            self.log(f"Peer {self.peer_id} received the 'not interested' message from {remote_peer_id}.")
             return
 
         if msg_type == MSG_CHOKE:
             self.peer_choking_us[remote_peer_id] = True
-            print(f"Peer {self.peer_id} was CHOKED by {remote_peer_id}")
+            self.log(f"Peer {self.peer_id} is choked by {remote_peer_id}.")
             return
 
         if msg_type == MSG_UNCHOKE:
             self.peer_choking_us[remote_peer_id] = False
-            print(f"Peer {self.peer_id} was UNCHOKED by {remote_peer_id}")
+            self.log(f"Peer {self.peer_id} is unchoked by {remote_peer_id}.")
 
             remote_bitfield = self.remote_bitfields.get(remote_peer_id)
             if remote_bitfield is None:
@@ -250,7 +315,6 @@ class Peer:
             piece_index = self.choose_piece_to_request(remote_bitfield)
             if piece_index is not None:
                 self.send_request(sock, piece_index)
-                print(f"Peer {self.peer_id} requested piece {piece_index} from {remote_peer_id}")
             return
 
         if msg_type == MSG_REQUEST:
@@ -261,9 +325,40 @@ class Peer:
 
         if msg_type == MSG_PIECE:
             piece_index, piece_data = self.parse_piece_payload(payload)
+            self.requested_pieces.discard(piece_index)
             self.set_piece(piece_index, piece_data)
-            print(f"Peer {self.peer_id} received piece {piece_index} from {remote_peer_id}")
+
+            # Count number of bytes downloaded from neighbor
+            self.download_counts[remote_peer_id] = (self.download_counts.get(remote_peer_id, 0) + len(piece_data))
+            self.log(
+                f"Peer {self.peer_id} has downloaded the piece {piece_index} "
+                f"from {remote_peer_id}. Now the number of pieces it has is "
+                f"{self.piece_count_loaded()}."
+            )
             self.broadcast_have(piece_index)
+
+            # If we now have all pieces, log it and update the file itself
+            if self.is_complete() and self.peer_id not in self.complete_peers:
+                self.write_complete_file()
+                self.complete_peers.add(self.peer_id)
+                self.log(f"Peer {self.peer_id} has downloaded the complete file.")
+
+            # See what other pieces the neighbor has
+            remote_bitfield = self.remote_bitfields.get(remote_peer_id)
+            if remote_bitfield is None:
+                return
+
+            # If neighbor is choking us, stop requesting
+            if self.peer_choking_us.get(remote_peer_id, True):
+                return
+
+            # Otherwise choose a piece we can request from this neighbor if there is one we need
+            next_piece_index = self.choose_piece_to_request(remote_bitfield)
+            if next_piece_index is not None:
+                self.send_request(sock, next_piece_index)
+            else:
+                self.send_not_interested(sock)
+
             return
 
         if msg_type == MSG_HAVE:
@@ -274,7 +369,12 @@ class Peer:
 
             remote_bitfield[piece_index] = 1
             self.remote_bitfields[remote_peer_id] = remote_bitfield
+            self.log(
+                f"Peer {self.peer_id} received the 'have' message from "
+                f"{remote_peer_id} for the piece {piece_index}."
+            )
             self.send_interest_decision(sock, remote_bitfield)
+            return
 
     def perform_outgoing_handshake(self, sock, expected_peer_id):
         sock.sendall(make_handshake(self.peer_id))
@@ -335,9 +435,11 @@ class Peer:
                 # Store the socket for later
                 self.connections[remote_peer_id] = sock
                 self.peer_choking_us[remote_peer_id] = True
+                self.peers_we_choking[remote_peer_id] = True
+                self.download_counts[remote_peer_id] = 0
                 self.send_bitfield(sock)
                 self.start_peer_listener(remote_peer_id, sock)
-                print(f"Peer {self.peer_id} accepted connection from peer {remote_peer_id}")
+                self.log(f"Peer {self.peer_id} is connected from Peer {remote_peer_id}.")
 
             except Exception as e:
                 print(f"Accept error: {e}")
@@ -358,3 +460,17 @@ class Peer:
 
         while True:
             time.sleep(1)
+
+    # Creates the peers log file
+    def setup_log_file(self):
+        with open(self.log_path, "w"):
+            pass
+
+    # Writes a log to the terminal and the peer's log file.
+    def log(self, message):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}]: {message}"
+        print(line)
+
+        with open(self.log_path, "a") as f:
+            f.write(line + "\n")

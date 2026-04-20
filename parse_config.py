@@ -79,8 +79,6 @@ def get_later_peers(peers, peer_id):
     return later
 
 
-
-
 # little test block right here, change however ya want,the Common.cfg should print with numeric fields shown as ints,
 # PeerInfo.cfg should print each peer dictionary and TEST LOOKUP should verify that helper functions work correctly
 
