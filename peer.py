@@ -160,13 +160,6 @@ class Peer:
         msg_type, payload = parse_message_body(body)
         return msg_type, payload
 
-    def receive_bitfield(self, sock):
-        msg_type, payload = self.receive_message(sock)
-        if msg_type != MSG_BITFIELD:
-            raise ValueError(f"Expected bitfield message, got type {msg_type}")
-
-        return parse_bitfield(payload, self.num_pieces)
-
     # Connect the peer to all peers with smaller IDs
     def connect_to_previous_peers(self):
         for peer in self.peer_info:
