@@ -3,8 +3,6 @@ from parse_config import (
     load_common_config,
     load_peer_info,
     get_peer_by_id,
-    get_previous_peers,
-    get_later_peers,
 )
 from peer import Peer
 

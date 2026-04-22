@@ -55,15 +55,11 @@ class Peer:
         # Downloading
         self.requested_pieces = set()
         self.download_counts = {}
+        self.requests_by_peer = {}
 
         # Peers we currently believe have the complete file
         self.complete_peers = {
             peer["peer_id"] for peer in self.peer_info if peer["has_file"]
-        }
-
-        # Peers with lower ids
-        self.previous_peer_ids = {
-            peer["peer_id"] for peer in self.peer_info if peer["peer_id"] < self.peer_id
         }
 
         # Peers with higher ids
@@ -82,6 +78,8 @@ class Peer:
 
         if self.has_file:
             self.load_file_into_pieces()
+        else:
+            self.init_empty_file()
 
     # Find this peer
     def find_current_peer(self):
@@ -221,6 +219,21 @@ class Peer:
                 self.bitfield[piece_index] = 1
                 piece_index += 1
 
+    # Creates an empty file of for peers starting without the completed file
+    def init_empty_file(self):
+        file_path = self.get_file_path()
+
+        with open(file_path, "wb") as f:
+            f.truncate(self.file_size)
+
+    # Writes one piece into the peers file, enables partial tracking
+    def write_piece_to_file(self, piece_index, piece_data):
+        file_path = self.get_file_path()
+        offset = piece_index * self.piece_size
+        with open(file_path, "r+b") as f:
+            f.seek(offset)
+            f.write(piece_data)
+
     # Once all pieces are acquired, update its file
     def write_complete_file(self):
         file_path = self.get_file_path()
@@ -281,9 +294,19 @@ class Peer:
         for remote_peer_id in list(self.connections.keys()):
             self.update_interest_for_neighbor(remote_peer_id)
 
-    def send_request(self, sock, piece_index):
+    def send_request(self, sock, remote_peer_id, piece_index):
         self.requested_pieces.add(piece_index)
+        self.requests_by_peer[remote_peer_id].add(piece_index)
         sock.sendall(make_request(piece_index))
+
+    # Ensures a piece doesnt get stuck forever if a peer is choked before its requested piece arrives
+    def close_requests_in_progress(self, remote_peer_id):
+        pending = self.requests_by_peer.get(remote_peer_id, set())
+        for piece_index in pending:
+            self.requested_pieces.discard(piece_index)
+
+        # Clear the set
+        self.requests_by_peer[remote_peer_id] = set()
 
     def parse_request_payload(self, payload):
         if len(payload) != 4:
@@ -327,6 +350,7 @@ class Peer:
 
         if msg_type == MSG_CHOKE:
             self.peer_choking_us[remote_peer_id] = True
+            self.close_requests_in_progress(remote_peer_id)
             self.log(f"Peer {self.peer_id} is choked by {remote_peer_id}.")
             return
 
@@ -340,7 +364,7 @@ class Peer:
 
             piece_index = self.choose_piece_to_request(remote_bitfield)
             if piece_index is not None:
-                self.send_request(sock, piece_index)
+                self.send_request(sock, remote_peer_id, piece_index)
             return
 
         if msg_type == MSG_REQUEST:
@@ -352,7 +376,9 @@ class Peer:
         if msg_type == MSG_PIECE:
             piece_index, piece_data = self.parse_piece_payload(payload)
             self.requested_pieces.discard(piece_index)
+            self.requests_by_peer[remote_peer_id].discard(piece_index)
             self.set_piece(piece_index, piece_data)
+            self.write_piece_to_file(piece_index, piece_data)
 
             # Count number of bytes downloaded from neighbor
             self.download_counts[remote_peer_id] = (self.download_counts.get(remote_peer_id, 0) + len(piece_data))
@@ -382,7 +408,7 @@ class Peer:
             # Otherwise choose a piece we can request from this neighbor if there is one we need
             next_piece_index = self.choose_piece_to_request(remote_bitfield)
             if next_piece_index is not None:
-                self.send_request(sock, next_piece_index)
+                self.send_request(sock, remote_peer_id, next_piece_index)
             else:
                 return
 
@@ -443,8 +469,9 @@ class Peer:
                 self.handle_message(remote_peer_id, sock, msg_type, payload)
             except Exception as e:
                 print(f"Peer {self.peer_id} lost connection to peer {remote_peer_id}: {e}")
+                self.close_requests_in_progress(remote_peer_id)
                 self.connections.pop(remote_peer_id, None)
-                # TODO
+                self.close_socket(sock)
                 break
 
     # Stores a newly established neighbor connection and initializes its state
@@ -453,6 +480,7 @@ class Peer:
         self.peer_choking_us[remote_peer_id] = True
         self.peers_we_choking[remote_peer_id] = True
         self.download_counts[remote_peer_id] = 0
+        self.requests_by_peer[remote_peer_id] = set()
 
     def close_socket(self, sock):
         if sock is None:
@@ -561,7 +589,7 @@ class Peer:
 
             self.preferred_peers = chosen
 
-            if chosen:
+            if chosen != old_preferred:
                 id_list = ", ".join(str(p) for p in sorted(chosen))
                 self.log(f"Peer {self.peer_id} has the preferred neighbors {id_list}.")
 
@@ -575,11 +603,12 @@ class Peer:
                 and p not in self.preferred_peers
             ]
 
-            if not candidates:
-                return
-
             old_opt = self.opt_unchoke_peer
-            new_opt = random.choice(candidates)
+            new_opt = None
+
+            # If there are no candidates, opt peer stays as None
+            if candidates:
+                new_opt = random.choice(candidates)
 
             # Choke the previous optimistic unchoke peer if they aren't now preferred
             if old_opt and old_opt != new_opt and old_opt not in self.preferred_peers:
@@ -592,13 +621,17 @@ class Peer:
 
             # Unchoke the new optimistic peer
             self.opt_unchoke_peer = new_opt
-            try:
-                self.connections[new_opt].sendall(make_unchoke())
-                self.peers_we_choking[new_opt] = False
-            except Exception:
-                pass
 
-            self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
+            if new_opt is not None and new_opt != old_opt:
+                if new_opt in self.connections:
+                    try:
+                        self.connections[new_opt].sendall(make_unchoke())
+                        self.peers_we_choking[new_opt] = False
+                    except Exception:
+                        pass
+
+                    # Only log if a new peer is chosen
+                    self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
         
     def _run_unchoke_timer(self):
         while len(self.complete_peers) < len(self.peer_info):
