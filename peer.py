@@ -379,34 +379,41 @@ class Peer:
 
         if msg_type == MSG_PIECE:
             piece_index, piece_data = self.parse_piece_payload(payload)
-            self.requested_pieces.discard(piece_index)
-            self.requests_by_peer[remote_peer_id].discard(piece_index)
-            self.set_piece(piece_index, piece_data)
+            log_complete = False
+
+            with self.lock:
+                self.requested_pieces.discard(piece_index)
+                self.requests_by_peer[remote_peer_id].discard(piece_index)
+                self.set_piece(piece_index, piece_data)
+
+                # Count number of bytes downloaded from neighbor
+                self.download_counts[remote_peer_id] = (
+                    self.download_counts.get(remote_peer_id, 0) + len(piece_data)
+                )
+
+                # Capture the count while holding the lock so the log stays accurate
+                piece_count = self.piece_count_loaded()
+
+                # Only mark/log completion once
+                if self.is_complete() and not self.logged_complete_file:
+                    self.logged_complete_file = True
+                    self.complete_peers.add(self.peer_id)
+                    log_complete = True
+
             self.write_piece_to_file(piece_index, piece_data)
 
-            # Count number of bytes downloaded from neighbor
-            self.download_counts[remote_peer_id] = (self.download_counts.get(remote_peer_id, 0) + len(piece_data))
             self.log(
                 f"Peer {self.peer_id} has downloaded the piece {piece_index} "
                 f"from {remote_peer_id}. Now the number of pieces it has is "
-                f"{self.piece_count_loaded()}."
+                f"{piece_count}."
             )
             self.broadcast_have(piece_index)
             self.update_interest_for_all_neighbors()
 
             # If we now have all pieces, log it and update the file itself
-            if self.is_complete():
-                log_complete = False
-
-                with self.lock:
-                    if not self.logged_complete_file:
-                        self.logged_complete_file = True
-                        self.complete_peers.add(self.peer_id)
-                        log_complete = True
-
-                if log_complete:
-                    self.write_complete_file()
-                    self.log(f"Peer {self.peer_id} has downloaded the complete file.")
+            if log_complete:
+                self.write_complete_file()
+                self.log(f"Peer {self.peer_id} has downloaded the complete file.")
 
             # See what other pieces the neighbor has
             remote_bitfield = self.remote_bitfields.get(remote_peer_id)
@@ -615,7 +622,7 @@ class Peer:
 
             self.preferred_peers = chosen
 
-            if chosen != old_preferred:
+            if chosen != old_preferred and chosen:
                 id_list = ", ".join(str(p) for p in sorted(chosen))
                 self.log(f"Peer {self.peer_id} has the preferred neighbors {id_list}.")
 
