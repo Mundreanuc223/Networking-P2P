@@ -46,6 +46,8 @@ class Peer:
         self.peer_choking_us = {}
         self.peers_we_choking = {}
         self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.logged_complete_file = False
 
         # Used for neighbor selection
         self.interested_peers = set()
@@ -335,6 +337,8 @@ class Peer:
         if msg_type == MSG_BITFIELD:
             remote_bitfield = parse_bitfield(payload, self.num_pieces)
             self.remote_bitfields[remote_peer_id] = remote_bitfield
+            if all(b == 1 for b in remote_bitfield):
+                self.complete_peers.add(remote_peer_id)
             self.update_interest_for_neighbor(remote_peer_id)
             return
 
@@ -391,10 +395,18 @@ class Peer:
             self.update_interest_for_all_neighbors()
 
             # If we now have all pieces, log it and update the file itself
-            if self.is_complete() and self.peer_id not in self.complete_peers:
-                self.write_complete_file()
-                self.complete_peers.add(self.peer_id)
-                self.log(f"Peer {self.peer_id} has downloaded the complete file.")
+            if self.is_complete():
+                log_complete = False
+
+                with self.lock:
+                    if not self.logged_complete_file:
+                        self.logged_complete_file = True
+                        self.complete_peers.add(self.peer_id)
+                        log_complete = True
+
+                if log_complete:
+                    self.write_complete_file()
+                    self.log(f"Peer {self.peer_id} has downloaded the complete file.")
 
             # See what other pieces the neighbor has
             remote_bitfield = self.remote_bitfields.get(remote_peer_id)
@@ -468,7 +480,6 @@ class Peer:
                 msg_type, payload = self.receive_message(sock)
                 self.handle_message(remote_peer_id, sock, msg_type, payload)
             except Exception as e:
-                print(f"Peer {self.peer_id} lost connection to peer {remote_peer_id}: {e}")
                 self.close_requests_in_progress(remote_peer_id)
                 self.connections.pop(remote_peer_id, None)
                 self.close_socket(sock)
@@ -489,6 +500,18 @@ class Peer:
             sock.close()
         except OSError:
             pass
+
+    def shutdown(self):
+        self.stop_event.set()
+
+        if self.server_socket is not None:
+            self.close_socket(self.server_socket)
+            self.server_socket = None
+
+        for sock in list(self.connections.values()):
+            self.close_socket(sock)
+
+        self.connections.clear()
 
     def __repr__(self):
         return (
@@ -520,7 +543,8 @@ class Peer:
 
             except Exception as e:
                 self.close_socket(sock)
-                print(f"Accept error: {e}")
+                if not self.stop_event.is_set():
+                    print(f"Accept error: {e}")
 
     # Starts the given peer and allows it to accept connections as well as connects to lower ID peers
     def start(self):
@@ -540,6 +564,8 @@ class Peer:
 
         while len(self.complete_peers) < len(self.peer_info):
             time.sleep(1)
+
+        self.shutdown()
 
     # Creates the peers log file
     def setup_log_file(self):
@@ -634,11 +660,15 @@ class Peer:
                     self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
         
     def _run_unchoke_timer(self):
-        while len(self.complete_peers) < len(self.peer_info):
+        while not self.stop_event.is_set():
             time.sleep(self.unchoking_interval)
+            if self.stop_event.is_set():
+                break
             self.select_preferred_neighbors()
 
     def _run_optimistic_unchoke_timer(self):
-        while len(self.complete_peers) < len(self.peer_info):
+        while not self.stop_event.is_set():
             time.sleep(self.optimistic_unchoking_interval)
+            if self.stop_event.is_set():
+                break
             self.select_optimistic_unchoke()
