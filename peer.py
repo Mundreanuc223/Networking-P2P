@@ -45,6 +45,7 @@ class Peer:
         self.remote_bitfields = {}
         self.peer_choking_us = {}
         self.peers_we_choking = {}
+        self.lock = threading.Lock()
 
         # Used for neighbor selection
         self.interested_peers = set()
@@ -317,8 +318,6 @@ class Peer:
         if msg_type == MSG_INTERESTED:
             self.interested_peers.add(remote_peer_id)
             self.log(f"Peer {self.peer_id} received the 'interested' message from {remote_peer_id}.")
-            sock.sendall(make_unchoke())
-            self.peers_we_choking[remote_peer_id] = False
             return
 
         if msg_type == MSG_NOT_INTERESTED:
@@ -346,7 +345,7 @@ class Peer:
 
         if msg_type == MSG_REQUEST:
             piece_index = self.parse_request_payload(payload)
-            if self.has_piece(piece_index):
+            if self.has_piece(piece_index) and not self.peers_we_choking.get(remote_peer_id, True):
                 self.send_piece_message(sock, piece_index)
             return
 
@@ -397,6 +396,8 @@ class Peer:
 
             remote_bitfield[piece_index] = 1
             self.remote_bitfields[remote_peer_id] = remote_bitfield
+            if all(b == 1 for b in remote_bitfield):
+                self.complete_peers.add(remote_peer_id)
             self.log(
                 f"Peer {self.peer_id} received the 'have' message from "
                 f"{remote_peer_id} for the piece {piece_index}."
@@ -505,9 +506,11 @@ class Peer:
         # Connect to all the peers that have already been started
         self.connect_to_previous_peers()
 
-        # TODO: start choke/unchoke timers here
+        # Start choke/unchoke timers
+        threading.Thread(target=self._run_unchoke_timer, daemon=True).start()
+        threading.Thread(target=self._run_optimistic_unchoke_timer, daemon=True).start()
 
-        while True:
+        while len(self.complete_peers) < len(self.peer_info):
             time.sleep(1)
 
     # Creates the peers log file
@@ -523,3 +526,86 @@ class Peer:
 
         with open(self.log_path, "a") as f:
             f.write(line + "\n")
+
+    def select_preferred_neighbors(self):
+        with self.lock:
+            candidates = list()
+            for p in self.interested_peers:
+                if p in self.connections:
+                    candidates.append(p)
+            if self.is_complete():
+                chosen = set(random.sample(candidates, min(self.num_preferred_neighbors, len(candidates))))
+            else:
+                random.shuffle(candidates)
+                candidates.sort(key=lambda p: self.download_counts.get(p, 0), reverse=True)
+                chosen = set(candidates[:self.num_preferred_neighbors])
+            for p in self.download_counts:
+                self.download_counts[p] = 0
+            old_preferred = self.preferred_peers
+
+            for p in chosen - old_preferred:
+                if p in self.connections:
+                    try:
+                        self.connections[p].sendall(make_unchoke())
+                        self.peers_we_choking[p] = False
+                    except Exception:
+                        pass
+
+            for p in old_preferred - chosen:
+                if p in self.connections and p != self.opt_unchoke_peer:
+                    try:
+                        self.connections[p].sendall(make_choke())
+                        self.peers_we_choking[p] = True
+                    except Exception:
+                        pass
+
+            self.preferred_peers = chosen
+
+            if chosen:
+                id_list = ", ".join(str(p) for p in sorted(chosen))
+                self.log(f"Peer {self.peer_id} has the preferred neighbors {id_list}.")
+
+    def select_optimistic_unchoke(self):
+        with self.lock:
+            # Candidates: choked, interested, connected, and not already a preferred neighbor
+            candidates = [
+                p for p in self.interested_peers
+                if p in self.connections
+                and self.peers_we_choking.get(p, True)
+                and p not in self.preferred_peers
+            ]
+
+            if not candidates:
+                return
+
+            old_opt = self.opt_unchoke_peer
+            new_opt = random.choice(candidates)
+
+            # Choke the previous optimistic unchoke peer if they aren't now preferred
+            if old_opt and old_opt != new_opt and old_opt not in self.preferred_peers:
+                if old_opt in self.connections:
+                    try:
+                        self.connections[old_opt].sendall(make_choke())
+                        self.peers_we_choking[old_opt] = True
+                    except Exception:
+                        pass
+
+            # Unchoke the new optimistic peer
+            self.opt_unchoke_peer = new_opt
+            try:
+                self.connections[new_opt].sendall(make_unchoke())
+                self.peers_we_choking[new_opt] = False
+            except Exception:
+                pass
+
+            self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
+        
+    def _run_unchoke_timer(self):
+        while len(self.complete_peers) < len(self.peer_info):
+            time.sleep(self.unchoking_interval)
+            self.select_preferred_neighbors()
+
+    def _run_optimistic_unchoke_timer(self):
+        while len(self.complete_peers) < len(self.peer_info):
+            time.sleep(self.optimistic_unchoking_interval)
+            self.select_optimistic_unchoke()
