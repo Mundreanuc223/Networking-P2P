@@ -126,7 +126,7 @@ class Peer:
 
     # After downloading a piece, notify all connected neighbors
     def broadcast_have(self, piece_index):
-        for neighbor_id, sock in self.connections.items():
+        for neighbor_id, sock in list(self.connections.items()):
             try:
                 sock.sendall(make_have(piece_index))
             except Exception as e:
