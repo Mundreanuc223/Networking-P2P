@@ -649,8 +649,7 @@ class Peer:
                     except Exception:
                         pass
 
-                    # Only log if a new peer is chosen
-                    self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
+                self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
         
     def _run_unchoke_timer(self):
         while not self.stop_event.is_set():
