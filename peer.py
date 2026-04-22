@@ -60,6 +60,16 @@ class Peer:
             peer["peer_id"] for peer in self.peer_info if peer["has_file"]
         }
 
+        # Peers with lower ids
+        self.previous_peer_ids = {
+            peer["peer_id"] for peer in self.peer_info if peer["peer_id"] < self.peer_id
+        }
+
+        # Peers with higher ids
+        self.later_peer_ids = {
+            peer["peer_id"] for peer in self.peer_info if peer["peer_id"] > self.peer_id
+        }
+
         # Path to this peer's required log file
         self.log_path = f"log_peer_{self.peer_id}.log"
 
@@ -137,6 +147,8 @@ class Peer:
         print(f"Peer {self.peer_id} listening on {self.host}:{self.port}")
 
     def send_bitfield(self, sock):
+        if not any(self.bitfield):
+            return
         sock.sendall(make_bitfield(self.bitfield))
 
     # Reads a recieved message
@@ -165,12 +177,12 @@ class Peer:
                     sock.settimeout(SERVER_TIMEOUT)
                     sock.connect((peer["host"], peer["port"]))
                     remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
-                    self.connections[remote_peer_id] = sock
-                    self.peer_choking_us[remote_peer_id] = True
-                    self.peers_we_choking[remote_peer_id] = True
+
+                    # After setup, don't timeout from inactivity
+                    sock.settimeout(None)
+                    self.register_connection(remote_peer_id, sock)
                     self.send_bitfield(sock)
                     self.start_peer_listener(remote_peer_id, sock)
-                    self.download_counts[remote_peer_id] = 0
                     self.log(f"Peer {self.peer_id} makes a connection to Peer {remote_peer_id}.")
 
                 except Exception as e:
@@ -253,6 +265,21 @@ class Peer:
         else:
             self.send_not_interested(sock)
 
+    # Reevaluate whether this peer should be interested in a neighbor
+    def update_interest_for_neighbor(self, remote_peer_id):
+        remote_bitfield = self.remote_bitfields.get(remote_peer_id)
+        sock = self.connections.get(remote_peer_id)
+
+        if remote_bitfield is None or sock is None:
+            return
+
+        self.send_interest_decision(sock, remote_bitfield)
+
+    # Reevaluate interest against every connected neighbor after this peer gets a new piece
+    def update_interest_for_all_neighbors(self):
+        for remote_peer_id in list(self.connections.keys()):
+            self.update_interest_for_neighbor(remote_peer_id)
+
     def send_request(self, sock, piece_index):
         self.requested_pieces.add(piece_index)
         sock.sendall(make_request(piece_index))
@@ -284,7 +311,7 @@ class Peer:
         if msg_type == MSG_BITFIELD:
             remote_bitfield = parse_bitfield(payload, self.num_pieces)
             self.remote_bitfields[remote_peer_id] = remote_bitfield
-            self.send_interest_decision(sock, remote_bitfield)
+            self.update_interest_for_neighbor(remote_peer_id)
             return
 
         if msg_type == MSG_INTERESTED:
@@ -336,6 +363,7 @@ class Peer:
                 f"{self.piece_count_loaded()}."
             )
             self.broadcast_have(piece_index)
+            self.update_interest_for_all_neighbors()
 
             # If we now have all pieces, log it and update the file itself
             if self.is_complete() and self.peer_id not in self.complete_peers:
@@ -357,7 +385,7 @@ class Peer:
             if next_piece_index is not None:
                 self.send_request(sock, next_piece_index)
             else:
-                self.send_not_interested(sock)
+                return
 
             return
 
@@ -373,7 +401,7 @@ class Peer:
                 f"Peer {self.peer_id} received the 'have' message from "
                 f"{remote_peer_id} for the piece {piece_index}."
             )
-            self.send_interest_decision(sock, remote_bitfield)
+            self.update_interest_for_neighbor(remote_peer_id)
             return
 
     def perform_outgoing_handshake(self, sock, expected_peer_id):
@@ -382,6 +410,21 @@ class Peer:
         remote_peer_id = parse_handshake(response)
         if remote_peer_id != expected_peer_id:
             raise ValueError(f"Expected peer {expected_peer_id}, but received handshake from {remote_peer_id}")
+        return remote_peer_id
+
+    def perform_incoming_handshake(self, sock):
+        data = self.receive_bytes(sock, HANDSHAKE_LENGTH)
+        remote_peer_id = parse_handshake(data)
+        if remote_peer_id not in self.later_peer_ids:
+            raise ValueError(
+                f"Peer {self.peer_id} received an unexpected connection from peer {remote_peer_id}"
+            )
+        if remote_peer_id in self.connections:
+            raise ValueError(
+                f"Peer {self.peer_id} already has a connection with peer {remote_peer_id}"
+            )
+
+        sock.sendall(make_handshake(self.peer_id))
         return remote_peer_id
 
     def start_peer_listener(self, remote_peer_id, sock):
@@ -402,6 +445,13 @@ class Peer:
                 self.connections.pop(remote_peer_id, None)
                 # TODO
                 break
+
+    # Stores a newly established neighbor connection and initializes its state
+    def register_connection(self, remote_peer_id, sock):
+        self.connections[remote_peer_id] = sock
+        self.peer_choking_us[remote_peer_id] = True
+        self.peers_we_choking[remote_peer_id] = True
+        self.download_counts[remote_peer_id] = 0
 
     def close_socket(self, sock):
         if sock is None:
@@ -424,27 +474,26 @@ class Peer:
             if server_socket is None:
                 break
 
+            sock = None
+
             try:
                 sock, address = server_socket.accept()
+                sock.settimeout(None)
 
                 # read the peers handshake and send one back
-                data = self.receive_bytes(sock, HANDSHAKE_LENGTH)
-                remote_peer_id = parse_handshake(data)
-                sock.sendall(make_handshake(self.peer_id))
+                remote_peer_id = self.perform_incoming_handshake(sock)
 
                 # Store the socket for later
-                self.connections[remote_peer_id] = sock
-                self.peer_choking_us[remote_peer_id] = True
-                self.peers_we_choking[remote_peer_id] = True
-                self.download_counts[remote_peer_id] = 0
+                self.register_connection(remote_peer_id, sock)
                 self.send_bitfield(sock)
                 self.start_peer_listener(remote_peer_id, sock)
                 self.log(f"Peer {self.peer_id} is connected from Peer {remote_peer_id}.")
 
             except Exception as e:
+                self.close_socket(sock)
                 print(f"Accept error: {e}")
 
-    # Starts the given peer and allows it to accept connections
+    # Starts the given peer and allows it to accept connections as well as connects to lower ID peers
     def start(self):
         self.start_server() # Starts the server
 
