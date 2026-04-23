@@ -16,3 +16,8 @@
 - `peer_[peerID]/`: Working directory for each peer, containing its copy of the file (complete or in progress).
 - `log_peer_[peerID].log`: Runtime log file generated for each peer.
 
+## Usage:
+- create a Common.cfg
+- create a PeerInfo.cfg
+- create a folder(s) for peer_* which has/have the file already
+- run 'python peerProcess.py 100*' in the terminal
