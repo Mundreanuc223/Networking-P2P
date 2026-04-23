@@ -77,25 +77,3 @@ def get_later_peers(peers, peer_id):
         if peer["peer_id"] > peer_id:
             later.append(peer)
     return later
-
-
-# little test block right here, change however ya want,the Common.cfg should print with numeric fields shown as ints,
-# PeerInfo.cfg should print each peer dictionary and TEST LOOKUP should verify that helper functions work correctly
-
-if __name__ == "__main__":
-    common = load_common_config("Common.cfg")
-    peers = load_peer_info("PeerInfo.cfg")
-
-    print("COMMON CONFIG:")
-    for key, value in common.items():
-        print(f"{key}: {value} ({type(value).__name__})")
-
-    print("\nPEER INFO:")
-    for peer in peers:
-        print(peer)
-
-    print("\nTEST LOOKUP:")
-    test_peer_id = 1003
-    print("Current peer:", get_peer_by_id(peers, test_peer_id))
-    print("Previous peers:", get_previous_peers(peers, test_peer_id))
-    print("Later peers:", get_later_peers(peers, test_peer_id))
