@@ -127,11 +127,7 @@ class Peer:
 
     # After downloading a piece, notify all connected neighbors
     def broadcast_have(self, piece_index):
-<<<<<<< HEAD
-        for neighbor_id, sock in list(self.connections.items()):
-=======
         for neighbor_id in list(self.connections.keys()):
->>>>>>> 17dc714af5f7bedb77ad1bf9e4b5c71fc7d76f77
             try:
                 self.send_to_peer(neighbor_id, make_have(piece_index))
             except Exception as e:
@@ -183,28 +179,42 @@ class Peer:
         msg_type, payload = parse_message_body(body)
         return msg_type, payload
 
+    def receive_bitfield(self, sock):
+        msg_type, payload = self.receive_message(sock)
+        if msg_type != MSG_BITFIELD:
+            raise ValueError(f"Expected bitfield message, got type {msg_type}")
+
+        return parse_bitfield(payload, self.num_pieces)
+
     # Connect the peer to all peers with smaller IDs
     def connect_to_previous_peers(self):
         for peer in self.peer_info:
             if peer["peer_id"] < self.peer_id:
-                sock = None
+                max_retries = 10
+                retry_delay = 0.5
 
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(SERVER_TIMEOUT)
-                    sock.connect((peer["host"], peer["port"]))
-                    remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
+                for attempt in range(max_retries):
+                    sock = None
+                    try:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(SERVER_TIMEOUT)
+                        sock.connect((peer["host"], peer["port"]))
+                        remote_peer_id = self.perform_outgoing_handshake(sock, peer["peer_id"])
 
-                    # After setup, don't timeout from inactivity
-                    sock.settimeout(None)
-                    self.register_connection(remote_peer_id, sock)
-                    self.send_bitfield(remote_peer_id)
-                    self.start_peer_listener(remote_peer_id, sock)
-                    self.log(f"Peer {self.peer_id} makes a connection to Peer {remote_peer_id}.")
+                        # After setup, don't timeout from inactivity
+                        sock.settimeout(None)
+                        self.register_connection(remote_peer_id, sock)
+                        self.send_bitfield(remote_peer_id)
+                        self.start_peer_listener(remote_peer_id, sock)
+                        self.log(f"Peer {self.peer_id} makes a connection to Peer {remote_peer_id}.")
+                        break
 
-                except Exception as e:
-                    self.close_socket(sock)
-                    print(f"Peer {self.peer_id} failed to connect to peer {peer['peer_id']}: {e}")
+                    except Exception as e:
+                        self.close_socket(sock)
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay)
+                        else:
+                            print(f"Peer {self.peer_id} failed to connect to peer {peer['peer_id']} after {max_retries} attempts: {e}")
 
     def receive_bytes(self, sock, size):
         buffer = bytearray()
@@ -472,6 +482,12 @@ class Peer:
                 f"{remote_peer_id} for the piece {piece_index}."
             )
             self.update_interest_for_neighbor(remote_peer_id)
+            
+            if not self.peers_we_choking.get(remote_peer_id, True):
+                if len(self.requests_by_peer.get(remote_peer_id, set())) == 0:
+                    piece_to_request = self.choose_piece_to_request(remote_bitfield)
+                    if piece_to_request is not None:
+                        self.send_request(remote_peer_id, piece_to_request)
             return
 
     def perform_outgoing_handshake(self, sock, expected_peer_id):
@@ -710,7 +726,8 @@ class Peer:
                     except Exception:
                         pass
 
-                self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
+                    # Only log if a new peer is chosen
+                    self.log(f"Peer {self.peer_id} has the optimistically unchoked neighbor {new_opt}.")
         
     def _run_unchoke_timer(self):
         while not self.stop_event.is_set():
